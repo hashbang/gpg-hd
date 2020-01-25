@@ -1,0 +1,135 @@
+#!/bin/bash
+
+# Really naive argument parser
+function usage(){
+	echo 'Usage: gen-gpg-keychain "Your name" "your@email.com" "passphrase"'
+}
+[ -z ${3+x} ] && { usage; exit 1; }
+[ -z ${4+x} ] || { usage; exit 1; }
+real_name="$1"
+email="$2"
+passphrase="$3"
+
+# Be explicit about charset/language
+export LC_ALL=
+export LANGUAGE=en
+
+# Use throw-away GNUPGHOME in ramdrive
+export GNUPGHOME=$(mktemp -d -p /dev/shm/)
+
+# Use terminal capable password entry form we can automate
+echo "pinentry-program /usr/bin/pinentry-tty" >> "$GNUPGHOME/gpg-agent.conf"
+
+# Start gpg-agent in a fixed location we can reference
+# Avoids clobbering with any user gpg-agents that may be in use
+gpg-agent \
+	--daemon \
+	--allow-preset-passphrase \
+	--extra-socket "$GNUPGHOME/S.gpg-agent" 2> /dev/null
+
+# Generate Master key #
+# * Use only 'Certify' Permission
+# * Capable of:
+#   - certifying changes to itself such as expiration date or new emails
+#   - adding/removing/revoking subkeys
+#   - issuing a public revocation certificate for entire keychain
+export GPG_AGENT_INFO=$GNUPGHOME/S.gpg-agent
+cat <<-EOF | gpg --batch --gen-key 2>/dev/null
+	Key-Type: RSA
+	Key-Length: 4096
+	Key-Usage: cert
+	Name-Real: $real_name
+	Name-Email: $email
+	Expire-Date: 1y
+	Passphrase: $passphrase
+EOF
+
+# Export master public key fingerprint
+fingerprint=$(
+	gpg --fingerprint "$email" 2>/dev/null | head -n2 | tail -n1 | sed 's/ //g'
+)
+
+# Generate Subkeys #
+# * Authentication (SSH, System login)
+# * Encryption (Password Manager, etc)
+# * Signing (Sign commits, emails, binaries, etc)
+expect <<-EOD > /dev/null
+	spawn gpg --expert --edit-key $fingerprint
+	expect "gpg>"
+	send "addkey\r"
+	expect "Your selection? "
+	send "8\r"
+	expect "Your selection? "
+	send "e\r"
+	expect "Your selection? "
+	send "q\r"
+	expect "What keysize do you want? (2048) "
+	send "4096\r"
+	expect "Key is valid for? (0) "
+	send "1y\r"
+	expect "Is this correct? (y/N) "
+	send "y\r"
+	expect "Really create? (y/N) "
+	send "y\r"
+	expect "Passphrase:"
+	send "$passphrase\r"
+	expect "gpg>"
+	send "addkey\r"
+	expect "Your selection? "
+	send "8\r"
+	expect "Your selection? "
+	send "s\r"
+	expect "Your selection? "
+	send "q\r"
+	expect "What keysize do you want? (2048) "
+	send "4096\r"
+	expect "Key is valid for? (0) "
+	send "1y\r"
+	expect "Is this correct? (y/N) "
+	send "y\r"
+	expect "Really create? (y/N) "
+	send "y\r"
+	expect "Passphrase:"
+	send "$passphrase\r"
+	expect "gpg>"
+	send "addkey\r"
+	expect "Your selection? "
+	send "8\r"
+	expect "Your selection? "
+	send "s\r"
+	expect "Your selection? "
+	send "e\r"
+	expect "Your selection? "
+	send "a\r"
+	expect "Your selection? "
+	send "q\r"
+	expect "What keysize do you want? (2048) "
+	send "4096\r"
+	expect "Key is valid for? (0) "
+	send "1y\r"
+	expect "Is this correct? (y/N) "
+	send "y\r"
+	expect "Really create? (y/N) "
+	send "y\r"
+	expect "Passphrase:"
+	send "$passphrase\r"
+	expect "gpg>"
+	send "quit\r"
+	expect "Save changes? (y/N)"
+	send "y\r"
+	expect "eof"
+	spawn gpg --export-secret-keys --armor -o $GNUPGHOME/master.asc
+	expect "Passphrase:"
+	send "$passphrase\r"
+	expect "eof"
+	spawn gpg --export --armor -o $GNUPGHOME/public.asc
+	expect eof
+EOD
+
+# Output keychain to stdout
+cat $GNUPGHOME/master.asc
+cat $GNUPGHOME/public.asc
+
+# Cleanup
+gpgconf --kill gpg-agent
+rm -rf $GNUPGHOME
